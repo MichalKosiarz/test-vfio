@@ -71,6 +71,9 @@ enum PocError {
 
     #[error("Device binding error: {0}")]
     DeviceBindingError(String),
+
+    #[error("Failed to send AQ command: {0}")]
+    FailedToSendAqCommand(String),
 }
 
 fn check_iommu_enabled() -> Result<(), PocError> {
@@ -906,6 +909,22 @@ struct VfioInterface {
     region_id: u32,
 }
 
+struct AqDescriptor {
+
+}
+
+pub trait AqSedDes {
+    fn serialize(&self) -> Result<Vec<u8>, PocError>;
+    fn deserialize(buffer: &[u8]) -> Result<Self, PocError> where Self: Sized;
+}
+pub trait SendAqCommand {
+    fn send_aq_command(&self, command: &AqDescriptor, buffer: &[u8]) -> Result<(), PocError>;
+}
+
+pub trait ReceiveAqCommand {
+    fn receive_aq_command(&self, command: &AqDescriptor) -> Result<Vec<u8>, PocError>;
+}
+
 impl VfioInterface {
     fn new(device: VfioDevice, region_id: u32) -> Self {
         VfioInterface { device, region_id }
@@ -932,6 +951,20 @@ impl VfioInterface {
 
     fn write_bulk(&self, offset: u64, data: &[u8]) -> Result<(), PocError> {
         self.device.region_write(self.region_id, data, offset);
+        Ok(())
+    }
+}
+
+pub trait AdminCommand: SendAqCommand + ReceiveAqCommand {
+    fn execute_command(&self, command: &AqDescriptor, buffer: &[u8]) -> Result<(), PocError> {
+        if buffer.len() > GL_HIBA_SIZE {
+            return Err(PocError::FailedToSendAqCommand(
+                "Buffer size exceeds maximum allowed".into(),
+            ));
+        }
+        self.send_aq_command(command, buffer)?;
+        thread::sleep(Duration::from_millis(100));
+        self.receive_aq_command(command)?;
         Ok(())
     }
 }
