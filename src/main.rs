@@ -5,6 +5,15 @@ use std::path::Path;
 use std::sync::Arc;
 use thiserror::Error;
 use vfio_ioctls::{VfioContainer, VfioDevice};
+use byteorder::{ByteOrder, NativeEndian};
+use std::time::Duration;
+use std::thread;
+
+const GL_HIDA: u64 = 0x00082000;
+const GL_HIDA_SIZE: usize = 32;
+const GL_HIBA: u64 = 0x00081000;
+const GL_HIBA_SIZE: usize = 4096;
+const GL_HICR: u64 = 0x00082040;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -87,7 +96,7 @@ fn check_iommu_enabled() -> Result<(), PocError> {
         return Err(PocError::IommuNotEnabled("VFIO device not found".into()));
     }
 
-    println!("✓ IOMMU is enabled with {group_count} groups");
+    println!("v IOMMU is enabled with {group_count} groups");
     Ok(())
 }
 
@@ -101,11 +110,11 @@ fn check_hardware_support() -> Result<(), PocError> {
 
     println!("Virtualization support:");
     if has_vmx {
-        println!("  ✓ Intel VT-x (vmx) - SUPPORTED");
+        println!("  v Intel VT-x (vmx) - SUPPORTED");
     } else if has_svm {
-        println!("  ✓ AMD-V (svm) - SUPPORTED");
+        println!("  v AMD-V (svm) - SUPPORTED");
     } else {
-        println!("  ✗ No virtualization support in processor");
+        println!("  x No virtualization support in processor");
         return Err(PocError::IommuNotEnabled(
             "CPU does not support virtualization".into(),
         ));
@@ -120,11 +129,11 @@ fn check_hardware_support() -> Result<(), PocError> {
 
     println!("IOMMU support in kernel:");
     if has_intel_iommu {
-        println!("  ✓ Intel IOMMU/VT-d detected");
+        println!("  v Intel IOMMU/VT-d detected");
     } else if has_amd_iommu {
-        println!("  ✓ AMD IOMMU/AMD-Vi detected");
+        println!("  v AMD IOMMU/AMD-Vi detected");
     } else {
-        println!("  ⚠ No IOMMU detection in dmesg - may be disabled");
+        println!("  ! No IOMMU detection in dmesg - may be disabled");
     }
 
     Ok(())
@@ -141,14 +150,14 @@ fn check_bios_settings() -> Result<(), PocError> {
         .unwrap_or("");
 
     if cpu_flags.contains("vmx") {
-        println!("  ✓ Intel VT-x enabled in BIOS");
+        println!("  v Intel VT-x enabled in BIOS");
         if cpu_flags.contains("ept") {
-            println!("  ✓ EPT (Extended Page Tables) available");
+            println!("  v EPT (Extended Page Tables) available");
         }
     } else if cpu_flags.contains("svm") {
-        println!("  ✓ AMD-V enabled in BIOS");
+        println!("  v AMD-V enabled in BIOS");
     } else {
-        println!("  ✗ Virtualization disabled in BIOS/UEFI");
+        println!("  x Virtualization disabled in BIOS/UEFI");
         println!("     Need to enable:");
         println!("     - Intel: VT-x and VT-d");
         println!("     - AMD: AMD-V and AMD-Vi");
@@ -163,12 +172,12 @@ fn check_bios_settings() -> Result<(), PocError> {
         let entries = fs::read_dir(iommu_groups_path)?;
         let group_count = entries.count();
         if group_count > 0 {
-            println!("  ✓ IOMMU working correctly ({group_count} groups)");
+            println!("  v IOMMU working correctly ({group_count} groups)");
         } else {
-            println!("  ✗ IOMMU enabled but no groups found");
+            println!("  x IOMMU enabled but no groups found");
         }
     } else {
-        println!("  ✗ IOMMU probably disabled in BIOS");
+        println!("  x IOMMU probably disabled in BIOS");
         println!("     Check settings:");
         println!("     - Intel: VT-d / Directed I/O");
         println!("     - AMD: AMD-Vi / IOMMU Support");
@@ -190,11 +199,11 @@ fn check_kernel_parameters() -> Result<(), PocError> {
 
     println!("\nParameter analysis:");
     if has_intel_iommu {
-        println!("  ✓ intel_iommu=on - Intel IOMMU enabled");
+        println!("  v intel_iommu=on - Intel IOMMU enabled");
     } else if has_amd_iommu {
-        println!("  ✓ amd_iommu=on - AMD IOMMU enabled");
+        println!("  v amd_iommu=on - AMD IOMMU enabled");
     } else {
-        println!("  ⚠ No IOMMU parameter in kernel");
+        println!("  ! No IOMMU parameter in kernel");
         println!("     Add to /etc/default/grub:");
 
         // Detect CPU vendor
@@ -211,9 +220,9 @@ fn check_kernel_parameters() -> Result<(), PocError> {
     }
 
     if has_iommu_pt {
-        println!("  ✓ iommu=pt - passthrough mode enabled");
+        println!("  v iommu=pt - passthrough mode enabled");
     } else {
-        println!("  ⚠ No iommu=pt - recommended for performance");
+        println!("  ! No iommu=pt - recommended for performance");
     }
 
     // Check current IOMMU status
@@ -221,9 +230,9 @@ fn check_kernel_parameters() -> Result<(), PocError> {
     if iommu_groups_path.exists() {
         let entries = fs::read_dir(iommu_groups_path)?;
         let group_count = entries.count();
-        println!("  ✓ IOMMU working: {group_count} groups available");
+        println!("  v IOMMU working: {group_count} groups available");
     } else {
-        println!("  ✗ IOMMU not working - check parameters and restart");
+        println!("  x IOMMU not working - check parameters and restart");
     }
 
     Ok(())
@@ -287,9 +296,9 @@ fn analyze_iommu_topology() -> Result<(), PocError> {
         println!("Group {}: {} device(s)", group_id, devices.len());
 
         if devices.len() > 1 {
-            println!("  ⚠ WARNING: Multiple devices in same IOMMU group (not isolated)");
+            println!("  ! WARNING: Multiple devices in same IOMMU group (not isolated)");
         } else {
-            println!("  ✓ Single device (good isolation)");
+            println!("  v Single device (good isolation)");
         }
 
         for (device, vendor, device_id, class) in devices {
@@ -393,7 +402,7 @@ fn check_device_drivers() -> Result<(), PocError> {
 
     println!("Devices bound to vfio-pci ({}):", vfio_devices.len());
     for (device, vendor, device_id, _) in &vfio_devices {
-        println!("  ✓ {device} [{vendor}:{device_id}] - Ready for passthrough");
+        println!("  v {device} [{vendor}:{device_id}] - Ready for passthrough");
     }
 
     println!(
@@ -406,21 +415,21 @@ fn check_device_drivers() -> Result<(), PocError> {
 
     println!("\nUnbound devices ({}):", unbound_devices.len());
     for (device, vendor, device_id, _) in &unbound_devices {
-        println!("  ○ {device} [{vendor}:{device_id}] - Available for binding");
+        println!("  o {device} [{vendor}:{device_id}] - Available for binding");
     }
 
     // Show vfio-pci driver status
     let vfio_pci_path = Path::new("/sys/bus/pci/drivers/vfio-pci");
     println!("\n=== VFIO-PCI Driver Status ===");
     if vfio_pci_path.exists() {
-        println!("  ✓ vfio-pci driver is loaded and available");
+        println!("  v vfio-pci driver is loaded and available");
 
         // Check new_id and remove_id capabilities
         if vfio_pci_path.join("new_id").exists() {
-            println!("  ✓ Dynamic device ID binding supported");
+            println!("  v Dynamic device ID binding supported");
         }
     } else {
-        println!("  ✗ vfio-pci driver not loaded");
+        println!("  x vfio-pci driver not loaded");
         println!("     Run: sudo modprobe vfio-pci");
     }
 
@@ -434,9 +443,9 @@ fn check_vm_readiness() -> Result<(), PocError> {
     println!("KVM Support:");
     let kvm_path = Path::new("/dev/kvm");
     if kvm_path.exists() {
-        println!("  ✓ /dev/kvm exists - KVM available");
+        println!("  v /dev/kvm exists - KVM available");
     } else {
-        println!("  ✗ /dev/kvm not found - KVM not available");
+        println!("  x /dev/kvm not found - KVM not available");
         println!("     Install: sudo apt install qemu-kvm");
     }
 
@@ -450,12 +459,12 @@ fn check_vm_readiness() -> Result<(), PocError> {
         Ok(output) if output.status.success() => {
             let version = String::from_utf8_lossy(&output.stdout);
             println!(
-                "  ✓ QEMU installed: {}",
+                "  v QEMU installed: {}",
                 version.lines().next().unwrap_or("unknown")
             );
         }
         _ => {
-            println!("  ✗ QEMU not found");
+            println!("  x QEMU not found");
             println!("     Install: sudo apt install qemu-system-x86");
         }
     }
@@ -466,7 +475,7 @@ fn check_vm_readiness() -> Result<(), PocError> {
     if let Ok(hugepages) = fs::read_to_string(hugepages_path) {
         let count: i32 = hugepages.trim().parse().unwrap_or(0);
         if count > 0 {
-            println!("  ✓ Hugepages configured: {count} pages");
+            println!("  v Hugepages configured: {count} pages");
 
             // Calculate memory
             let hugepage_size = fs::read_to_string("/proc/meminfo")
@@ -480,7 +489,7 @@ fn check_vm_readiness() -> Result<(), PocError> {
             let total_mb = (count * hugepage_size) / 1024;
             println!("     Total hugepage memory: {total_mb} MB");
         } else {
-            println!("  ⚠ No hugepages configured");
+            println!("  ! No hugepages configured");
             println!("     Consider: echo 1024 | sudo tee /proc/sys/vm/nr_hugepages");
         }
     }
@@ -489,7 +498,7 @@ fn check_vm_readiness() -> Result<(), PocError> {
     println!("\nCPU Isolation:");
     let cmdline = fs::read_to_string("/proc/cmdline").unwrap_or_default();
     if cmdline.contains("isolcpus=") {
-        println!("  ✓ CPU isolation configured");
+        println!("  v CPU isolation configured");
         if let Some(isolcpus) = cmdline
             .split_whitespace()
             .find(|arg| arg.starts_with("isolcpus="))
@@ -497,7 +506,7 @@ fn check_vm_readiness() -> Result<(), PocError> {
             println!("     {isolcpus}");
         }
     } else {
-        println!("  ⚠ No CPU isolation configured");
+        println!("  ! No CPU isolation configured");
         println!("     Consider isolating CPUs for better VM performance");
     }
 
@@ -509,17 +518,17 @@ fn check_vm_readiness() -> Result<(), PocError> {
     if nested_intel.exists() {
         if let Ok(nested) = fs::read_to_string(nested_intel) {
             if nested.trim() == "Y" || nested.trim() == "1" {
-                println!("  ✓ Intel nested virtualization enabled");
+                println!("  v Intel nested virtualization enabled");
             } else {
-                println!("  ⚠ Intel nested virtualization disabled");
+                println!("  ! Intel nested virtualization disabled");
             }
         }
     } else if nested_amd.exists() {
         if let Ok(nested) = fs::read_to_string(nested_amd) {
             if nested.trim() == "Y" || nested.trim() == "1" {
-                println!("  ✓ AMD nested virtualization enabled");
+                println!("  v AMD nested virtualization enabled");
             } else {
-                println!("  ⚠ AMD nested virtualization disabled");
+                println!("  ! AMD nested virtualization disabled");
             }
         }
     }
@@ -532,10 +541,10 @@ fn check_vm_readiness() -> Result<(), PocError> {
 
     match libvirt_check {
         Ok(output) if output.status.success() => {
-            println!("  ✓ Libvirt available");
+            println!("  v Libvirt available");
         }
         _ => {
-            println!("  ○ Libvirt not installed (optional)");
+            println!("  o Libvirt not installed (optional)");
             println!("     Install: sudo apt install libvirt-daemon-system");
         }
     }
@@ -554,7 +563,7 @@ fn unbind_device(device: &str) -> Result<(), PocError> {
     // Check if device has a driver
     let driver_path = device_path.join("driver");
     if !driver_path.exists() {
-        println!("  ○ Device {device} is already unbound");
+        println!("  o Device {device} is already unbound");
         return Ok(());
     }
 
@@ -575,7 +584,7 @@ fn unbind_device(device: &str) -> Result<(), PocError> {
 
     if unbind_path.exists() {
         fs::write(&unbind_path, device)?;
-        println!("  ✓ Successfully unbound {device} from {current_driver}");
+        println!("  v Successfully unbound {device} from {current_driver}");
     } else {
         return Err(PocError::DeviceBindingError(format!(
             "Unbind path not found for driver {current_driver}"
@@ -635,7 +644,7 @@ fn bind_device_to_vfio(device: &str) -> Result<(), PocError> {
     // Bind to vfio-pci
     if new_id_path.exists() {
         fs::write(&new_id_path, &id_string)?;
-        println!("  ✓ Successfully bound {device} to vfio-pci");
+        println!("  v Successfully bound {device} to vfio-pci");
     } else {
         return Err(PocError::DeviceBindingError(
             "vfio-pci driver does not support new_id".into(),
@@ -653,12 +662,12 @@ fn bind_device_to_vfio(device: &str) -> Result<(), PocError> {
             .unwrap_or_else(|| "unknown".to_string());
 
         if current_driver == "vfio-pci" {
-            println!("  ✓ Binding verified successfully");
+            println!("  v Binding verified successfully");
         } else {
-            println!("  ⚠ Binding may have failed - current driver: {current_driver}");
+            println!("  ! Binding may have failed - current driver: {current_driver}");
         }
     } else {
-        println!("  ⚠ Device appears to be unbound after binding attempt");
+        println!("  ! Device appears to be unbound after binding attempt");
     }
 
     Ok(())
@@ -681,12 +690,12 @@ fn check_security_settings() -> Result<(), PocError> {
 
         // Check if current user can access
         if vfio_path.metadata().is_ok() {
-            println!("  ✓ Current user can access /dev/vfio/vfio");
+            println!("  v Current user can access /dev/vfio/vfio");
         } else {
-            println!("  ✗ Current user cannot access /dev/vfio/vfio");
+            println!("  x Current user cannot access /dev/vfio/vfio");
         }
     } else {
-        println!("  ✗ /dev/vfio/vfio not found");
+        println!("  x /dev/vfio/vfio not found");
     }
 
     // Check user groups
@@ -697,16 +706,16 @@ fn check_security_settings() -> Result<(), PocError> {
     println!("  Current groups: {}", groups.trim());
 
     if groups.contains("vfio") {
-        println!("  ✓ User is in vfio group");
+        println!("  v User is in vfio group");
     } else {
-        println!("  ⚠ User not in vfio group");
+        println!("  ! User not in vfio group");
         println!("     Add with: sudo usermod -a -G vfio $USER");
     }
 
     if groups.contains("kvm") {
-        println!("  ✓ User is in kvm group");
+        println!("  v User is in kvm group");
     } else {
-        println!("  ⚠ User not in kvm group");
+        println!("  ! User not in kvm group");
         println!("     Add with: sudo usermod -a -G kvm $USER");
     }
 
@@ -717,15 +726,15 @@ fn check_security_settings() -> Result<(), PocError> {
     if secureboot_path.exists() {
         if let Ok(data) = fs::read(secureboot_path) {
             if data.len() >= 5 && data[4] == 1 {
-                println!("  ⚠ Secure Boot is ENABLED");
+                println!("  ! Secure Boot is ENABLED");
                 println!("     May cause issues with unsigned VFIO modules");
                 println!("     Consider disabling in BIOS or signing modules");
             } else {
-                println!("  ✓ Secure Boot is disabled");
+                println!("  v Secure Boot is disabled");
             }
         }
     } else {
-        println!("  ○ Secure Boot status unknown (not EFI or no SecureBoot var)");
+        println!("  o Secure Boot status unknown (not EFI or no SecureBoot var)");
     }
 
     // Check SELinux/AppArmor
@@ -736,15 +745,15 @@ fn check_security_settings() -> Result<(), PocError> {
         if let Ok(status) = fs::read_to_string("/sys/fs/selinux/enforce") {
             match status.trim() {
                 "1" => {
-                    println!("  ⚠ SELinux is in enforcing mode");
+                    println!("  ! SELinux is in enforcing mode");
                     println!("     May require additional policies for VFIO");
                 }
-                "0" => println!("  ✓ SELinux is in permissive mode"),
-                _ => println!("  ○ SELinux status unknown"),
+                "0" => println!("  v SELinux is in permissive mode"),
+                _ => println!("  o SELinux status unknown"),
             }
         }
     } else {
-        println!("  ✓ SELinux not active");
+        println!("  v SELinux not active");
     }
 
     // AppArmor check
@@ -752,10 +761,10 @@ fn check_security_settings() -> Result<(), PocError> {
 
     match apparmor_check {
         Ok(output) if output.status.success() => {
-            println!("  ⚠ AppArmor is active");
+            println!("  ! AppArmor is active");
             println!("     May require profiles for VFIO usage");
         }
-        _ => println!("  ✓ AppArmor not active or not installed"),
+        _ => println!("  v AppArmor not active or not installed"),
     }
 
     // Check IOMMU group ownership
@@ -775,9 +784,9 @@ fn check_security_settings() -> Result<(), PocError> {
     for module in &vfio_modules {
         let module_path = format!("/sys/module/{module}");
         if Path::new(&module_path).exists() {
-            println!("  ✓ {module} module loaded");
+            println!("  v {module} module loaded");
         } else {
-            println!("  ✗ {module} module not loaded");
+            println!("  x {module} module not loaded");
         }
     }
 
@@ -789,25 +798,25 @@ fn run_diagnostics() -> Result<(), PocError> {
 
     // Check hardware support
     if let Err(e) = check_hardware_support() {
-        println!("✗ Hardware support problem: {e}");
+        println!("x Hardware support problem: {e}");
         return Err(e);
     }
 
     // Check BIOS settings
     if let Err(e) = check_bios_settings() {
-        println!("✗ BIOS settings problem: {e}");
+        println!("x BIOS settings problem: {e}");
         return Err(e);
     }
 
     // Check kernel parameters
     if let Err(e) = check_kernel_parameters() {
-        println!("✗ Kernel parameters problem: {e}");
+        println!("x Kernel parameters problem: {e}");
         return Err(e);
     }
 
     println!("\n=== SUMMARY ===");
-    println!("✓ All checks passed successfully!");
-    println!("✓ IOMMU is properly configured");
+    println!("v All checks passed successfully!");
+    println!("v IOMMU is properly configured");
 
     Ok(())
 }
@@ -815,7 +824,7 @@ fn run_diagnostics() -> Result<(), PocError> {
 fn list_devices_with_iommu() -> Result<(), PocError> {
     let pci_devices_path = Path::new("/sys/bus/pci/devices");
     if !pci_devices_path.exists() {
-        println!("✗ PCI devices directory not found");
+        println!("x PCI devices directory not found");
         return Ok(());
     }
 
@@ -886,10 +895,45 @@ fn list_devices_with_iommu() -> Result<(), PocError> {
     }
 
     if !found_devices {
-        println!("⚠ No PCI devices with IOMMU found");
+        println!("! No PCI devices with IOMMU found");
     }
 
     Ok(())
+}
+
+struct VfioInterface {
+    device: VfioDevice,
+    region_id: u32,
+}
+
+impl VfioInterface {
+    fn new(device: VfioDevice, region_id: u32) -> Self {
+        VfioInterface { device, region_id }
+    }
+
+    fn read_register32(&self, offset: u64) -> Result<u32, PocError> {
+        let mut buffer = [0u8; 4];
+        self.device.region_read(self.region_id, &mut buffer, offset);
+        Ok(NativeEndian::read_u32(&buffer))
+    }
+
+    fn write_register32(&self, offset: u64, value: u32) -> Result<(), PocError> {
+        let mut buffer = [0u8; 4];
+        NativeEndian::write_u32(&mut buffer, value);
+        self.device.region_write(self.region_id, &buffer, offset);
+        Ok(())
+    }
+
+    fn read_bulk(&self, offset: u64, size: usize) -> Result<Vec<u8>, PocError> {
+        let mut buffer = vec![0u8; size];
+        self.device.region_read(self.region_id, &mut buffer, offset);
+        Ok(buffer)
+    }
+
+    fn write_bulk(&self, offset: u64, data: &[u8]) -> Result<(), PocError> {
+        self.device.region_write(self.region_id, data, offset);
+        Ok(())
+    }
 }
 
 fn main() -> Result<(), PocError> {
@@ -958,13 +1002,34 @@ fn main() -> Result<(), PocError> {
             return Err(PocError::IommuNotEnabled("IOMMU group not found".into()));
         }
 
-        println!("✓ Device has IOMMU group: {iommu_group_path:?}",);
+        println!("v Device has IOMMU group: {iommu_group_path:?}",);
 
-        // let device =
-        VfioDevice::new(&device_path, container.clone())?;
+        let device = VfioDevice::new(&device_path, container.clone())?;
+        println!("v Successfully created VFIO device for {device_path_str}");
 
-        println!("✓ Successfully created VFIO device for {device_path_str}");
+        let vfio = VfioInterface::new(device, 0);
+
+        let descriptor = vfio.read_bulk(GL_HIDA, GL_HIDA_SIZE)?;
+        println!("Descriptor: {:?}", descriptor);
+
+        let descriptor_to_send: [u8; 32] = [0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        vfio.write_bulk(GL_HIDA, &descriptor_to_send)?;
+        let descriptor = vfio.read_bulk(GL_HIDA, GL_HIDA_SIZE)?;
+        println!("Descriptor: {:?}", descriptor);
+
+        let mut value = vfio.read_register32(GL_HICR)?;
+        println!("HICR value: {:?}", value);
+        value = 0x02;
+        vfio.write_register32(GL_HICR, value)?;
+        value = vfio.read_register32(GL_HICR)?;
+        println!("HICR value: {:?}", value);
+
+        thread::sleep(Duration::from_millis(100));
+
+        let descriptor = vfio.read_bulk(GL_HIDA, GL_HIDA_SIZE)?;
+        println!("Descriptor: {:?}", descriptor);
+        value = vfio.read_register32(GL_HICR)?;
+        println!("HICR value: {:?}", value);
     }
-
     Ok(())
 }
