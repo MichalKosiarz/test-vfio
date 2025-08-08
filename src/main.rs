@@ -56,7 +56,7 @@ struct Args {
 }
 
 #[derive(Error, Debug)]
-enum PocError {
+pub enum PocError {
     #[error("Failed on VFIO create {0}")]
     VfioFailed(#[from] vfio_ioctls::VfioError),
 
@@ -910,12 +910,12 @@ fn list_devices_with_iommu() -> Result<(), PocError> {
     Ok(())
 }
 
-struct VfioInterface {
+pub struct VfioInterface {
     device: VfioDevice,
     region_id: u32,
 }
 
-struct AqDescriptor<T>
+pub struct AqDescriptor<T>
 where
     T: AqSerDes,
     T: Default,
@@ -927,6 +927,43 @@ where
     cookie_high: u32,
     cookie_low: u32,
     flex_data: T,
+}
+
+impl<T: Default + AqSerDes> AqDescriptor<T> {
+    pub fn new(
+        flags: u16,
+        opcode: u16,
+        datalen: u16,
+        retval: u16,
+        cookie_high: u32,
+        cookie_low: u32,
+        flex_data: T,
+    ) -> Self {
+        AqDescriptor {
+            flags,
+            opcode,
+            datalen,
+            retval,
+            cookie_high,
+            cookie_low,
+            flex_data,
+        }
+    }
+
+    pub fn from_opcode(
+        opcode: u16,
+        flex_data: T,
+    ) -> Self {
+        AqDescriptor::new(
+            0x0200, // Default flags
+            opcode,
+            0,      // Default data length
+            0,      // Default return value
+            0,      // Default cookie high
+            0,      // Default cookie low
+            flex_data,
+        )
+    }
 }
 
 #[derive(Default)]
@@ -1058,6 +1095,12 @@ impl<T: Default + AqSerDes> SendAqCommand<T> for VfioInterface {
         if let Some(data) = buffer {
             self.write_bulk(GL_HIBA + serialized_command.len() as u64, data)?;
         }
+
+        let mut value = self.read_register32(GL_HICR)?;
+        value |= 0x02;
+        value &= !0x04;
+        self.write_register32(GL_HICR, value)?;
+
         Ok(())
     }
 }
@@ -1173,19 +1216,13 @@ fn main() -> Result<(), PocError> {
         let descriptor = vfio.read_bulk(GL_HIDA, GL_HIDA_SIZE)?;
         println!("Descriptor: {:?}", descriptor);
 
-        let descriptor_to_send: [u8; 32] = [
-            0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0,
-        ];
-        vfio.write_bulk(GL_HIDA, &descriptor_to_send)?;
-        let descriptor = vfio.read_bulk(GL_HIDA, GL_HIDA_SIZE)?;
-        println!("Descriptor: {:?}", descriptor);
+        let descriptor_to_send = AqDescriptor::from_opcode(1, GenericData::default());
+        vfio.send_aq_command(&descriptor_to_send, None)?;
 
         let mut value = vfio.read_register32(GL_HICR)?;
-        println!("HICR value: {:?}", value);
-        value = 0x02;
-        vfio.write_register32(GL_HICR, value)?;
-        value = vfio.read_register32(GL_HICR)?;
+        let descriptor = vfio.read_bulk(GL_HIDA, GL_HIDA_SIZE)?;
+
+        println!("Descriptor: {:?}", descriptor);
         println!("HICR value: {:?}", value);
 
         thread::sleep(Duration::from_millis(100));
