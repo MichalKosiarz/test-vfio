@@ -1004,13 +1004,13 @@ pub trait AqSerDes {
 pub trait SendAqCommand<T: Default + AqSerDes> {
     fn send_aq_command(
         &self,
-        command: &AqDescriptor<T>,
+        command: &mut AqDescriptor<T>,
         buffer: Option<&[u8]>,
     ) -> Result<(), PocError>;
 }
 
 pub trait ReceiveAqCommand<T: Default + AqSerDes> {
-    fn receive_aq_command(&self, command: &AqDescriptor<T>) -> Result<Vec<u8>, PocError>;
+    fn receive_aq_command(&self) -> Result<(AqDescriptor<T>, Vec<u8>), PocError>;
 }
 
 impl<T: Default + AqSerDes> AqSerDes for AqDescriptor<T> {
@@ -1084,14 +1084,25 @@ impl VfioInterface {
 impl<T: Default + AqSerDes> SendAqCommand<T> for VfioInterface {
     fn send_aq_command(
         &self,
-        command: &AqDescriptor<T>,
+        command: &mut AqDescriptor<T>,
         buffer: Option<&[u8]>,
     ) -> Result<(), PocError> {
+        if let Some(data) = buffer {
+            if data.len() > GL_HIBA_SIZE {
+                return Err(PocError::FailedToSendAqCommand(
+                    "Buffer size exceeds maximum allowed".into(),
+                ));
+            }
+            self.write_bulk(GL_HIBA, &data)?;
+            command.datalen = data.len() as u16;
+            command.flags |= 0x1000;
+            if data.len() > 512 {
+                command.flags |= 0x200; // Set the flag for large data
+            }
+        }
+
         let serialized_command = command.serialize()?;
         self.write_bulk(GL_HIDA, &serialized_command)?;
-        if let Some(data) = buffer {
-            self.write_bulk(GL_HIBA + serialized_command.len() as u64, data)?;
-        }
 
         let mut value = self.read_register32(GL_HICR)?;
         value |= 0x02;
@@ -1103,15 +1114,16 @@ impl<T: Default + AqSerDes> SendAqCommand<T> for VfioInterface {
 }
 
 impl<T: Default + AqSerDes> ReceiveAqCommand<T> for VfioInterface {
-    fn receive_aq_command(&self, command: &AqDescriptor<T>) -> Result<Vec<u8>, PocError> {
-        let serialized_command = command.serialize()?;
-        let response = self.read_bulk(GL_HIDA, serialized_command.len())?;
+    fn receive_aq_command(&self) -> Result<(AqDescriptor<T>, Vec<u8>), PocError> {
+        let raw_descriptor = self.read_bulk(GL_HIDA, GL_HIDA_SIZE)?;
+        let command = AqDescriptor::<T>::deserialize(&raw_descriptor)?;
+        let response = self.read_bulk(GL_HIDA, command.datalen as usize)?;
         if response.is_empty() {
             return Err(PocError::FailedToReceiveAqCommand(
                 "No response received".into(),
             ));
         }
-        Ok(response)
+        Ok((command, response))
     }
 }
 
@@ -1120,7 +1132,7 @@ impl<T: Default + AqSerDes> AdminCommand<T> for VfioInterface {}
 pub trait AdminCommand<T: Default + AqSerDes>: SendAqCommand<T> + ReceiveAqCommand<T> {
     fn execute_command(
         &self,
-        command: &AqDescriptor<T>,
+        command: &mut AqDescriptor<T>,
         buffer: Option<&[u8]>,
     ) -> Result<(), PocError> {
         if let Some(buffer) = buffer {
@@ -1132,7 +1144,7 @@ pub trait AdminCommand<T: Default + AqSerDes>: SendAqCommand<T> + ReceiveAqComma
         }
         self.send_aq_command(command, buffer)?;
         thread::sleep(Duration::from_millis(100));
-        self.receive_aq_command(command)?;
+        self.receive_aq_command()?;
         Ok(())
     }
 }
@@ -1215,8 +1227,8 @@ fn main() -> Result<(), PocError> {
         let descriptor = vfio.read_bulk(GL_HIDA, GL_HIDA_SIZE)?;
         println!("Descriptor: {descriptor:?}");
 
-        let descriptor_to_send = AqDescriptor::from_opcode(1, GenericData::default());
-        vfio.send_aq_command(&descriptor_to_send, None)?;
+        let mut descriptor_to_send = AqDescriptor::from_opcode(1, GenericData::default());
+        vfio.send_aq_command(&mut descriptor_to_send, None)?;
 
         let mut value = vfio.read_register32(GL_HICR)?;
         let descriptor = vfio.read_bulk(GL_HIDA, GL_HIDA_SIZE)?;
