@@ -652,6 +652,7 @@ fn bind_device_to_vfio(device: &str) -> Result<(), PocError> {
 
     // Bind to vfio-pci
     if new_id_path.exists() {
+        println!("  Binding {device} to vfio-pci driver...");
         fs::write(&new_id_path, &id_string)?;
         println!("  v Successfully bound {device} to vfio-pci");
     } else {
@@ -950,17 +951,13 @@ impl<T: Default + AqSerDes> AqDescriptor<T> {
         }
     }
 
-    pub fn from_opcode(
-        opcode: u16,
-        flex_data: T,
-    ) -> Self {
+    pub fn from_opcode(opcode: u16, flex_data: T) -> Self {
         AqDescriptor::new(
             0x0200, // Default flags
-            opcode,
-            0,      // Default data length
-            0,      // Default return value
-            0,      // Default cookie high
-            0,      // Default cookie low
+            opcode, 0, // Default data length
+            0, // Default return value
+            0, // Default cookie high
+            0, // Default cookie low
             flex_data,
         )
     }
@@ -1188,6 +1185,8 @@ fn main() -> Result<(), PocError> {
         check_iommu_enabled()?;
 
         let device_path_str = args.device.as_deref().unwrap();
+        // bind_device_to_vfio(device_path_str)?;
+
         let device_path = Path::new("/sys/bus/pci/devices").join(device_path_str);
 
         println!("Using device: {device_path_str}");
@@ -1214,7 +1213,7 @@ fn main() -> Result<(), PocError> {
         let vfio = VfioInterface::new(device, 0);
 
         let descriptor = vfio.read_bulk(GL_HIDA, GL_HIDA_SIZE)?;
-        println!("Descriptor: {:?}", descriptor);
+        println!("Descriptor: {descriptor:?}");
 
         let descriptor_to_send = AqDescriptor::from_opcode(1, GenericData::default());
         vfio.send_aq_command(&descriptor_to_send, None)?;
@@ -1222,15 +1221,15 @@ fn main() -> Result<(), PocError> {
         let mut value = vfio.read_register32(GL_HICR)?;
         let descriptor = vfio.read_bulk(GL_HIDA, GL_HIDA_SIZE)?;
 
-        println!("Descriptor: {:?}", descriptor);
-        println!("HICR value: {:?}", value);
+        println!("Descriptor: {descriptor:?}");
+        println!("HICR value: {value:?}");
 
         thread::sleep(Duration::from_millis(100));
 
         let descriptor = vfio.read_bulk(GL_HIDA, GL_HIDA_SIZE)?;
-        println!("Descriptor: {:?}", descriptor);
+        println!("Descriptor: {descriptor:?}");
         value = vfio.read_register32(GL_HICR)?;
-        println!("HICR value: {:?}", value);
+        println!("HICR value: {value:?}");
     }
     Ok(())
 }
