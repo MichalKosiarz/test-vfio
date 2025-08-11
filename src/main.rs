@@ -1,13 +1,13 @@
+use byteorder::{ByteOrder, NativeEndian};
 use clap::Parser;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 use thiserror::Error;
 use vfio_ioctls::{VfioContainer, VfioDevice};
-use byteorder::{ByteOrder, NativeEndian};
-use std::time::Duration;
-use std::thread;
 
 const GL_HIDA: u64 = 0x00082000;
 const GL_HIDA_SIZE: usize = 32;
@@ -56,7 +56,7 @@ struct Args {
 }
 
 #[derive(Error, Debug)]
-enum PocError {
+pub enum PocError {
     #[error("Failed on VFIO create {0}")]
     VfioFailed(#[from] vfio_ioctls::VfioError),
 
@@ -71,6 +71,15 @@ enum PocError {
 
     #[error("Device binding error: {0}")]
     DeviceBindingError(String),
+
+    #[error("Failed to send AQ command: {0}")]
+    FailedToSendAqCommand(String),
+
+    #[error("Failed to receive AQ command: {0}")]
+    FailedToReceiveAqCommand(String),
+
+    #[error("Failed to deserialize AQ command.")]
+    DeserializationError,
 }
 
 fn check_iommu_enabled() -> Result<(), PocError> {
@@ -643,6 +652,7 @@ fn bind_device_to_vfio(device: &str) -> Result<(), PocError> {
 
     // Bind to vfio-pci
     if new_id_path.exists() {
+        println!("  Binding {device} to vfio-pci driver...");
         fs::write(&new_id_path, &id_string)?;
         println!("  v Successfully bound {device} to vfio-pci");
     } else {
@@ -901,9 +911,145 @@ fn list_devices_with_iommu() -> Result<(), PocError> {
     Ok(())
 }
 
-struct VfioInterface {
+pub struct VfioInterface {
     device: VfioDevice,
     region_id: u32,
+}
+
+#[derive(Debug)]
+pub struct AqDescriptor<T>
+where
+    T: AqSerDes,
+    T: Default,
+{
+    flags: u16,
+    opcode: u16,
+    datalen: u16,
+    retval: u16,
+    cookie_high: u32,
+    cookie_low: u32,
+    flex_data: T,
+}
+
+impl<T: Default + AqSerDes> AqDescriptor<T> {
+    pub fn new(
+        flags: u16,
+        opcode: u16,
+        datalen: u16,
+        retval: u16,
+        cookie_high: u32,
+        cookie_low: u32,
+        flex_data: T,
+    ) -> Self {
+        AqDescriptor {
+            flags,
+            opcode,
+            datalen,
+            retval,
+            cookie_high,
+            cookie_low,
+            flex_data,
+        }
+    }
+
+    pub fn from_opcode(opcode: u16, flex_data: T) -> Self {
+        AqDescriptor::new(
+            0x0200, // Default flags
+            opcode, 0, // Default data length
+            0, // Default return value
+            0, // Default cookie high
+            0, // Default cookie low
+            flex_data,
+        )
+    }
+}
+
+#[derive(Default, Debug)]
+struct GenericData {
+    param0: u32,
+    param1: u32,
+    addr_high: u32,
+    addr_low: u32,
+}
+
+impl AqSerDes for GenericData {
+    fn serialize(&self) -> Result<Vec<u8>, PocError> {
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(&self.param0.to_le_bytes());
+        buffer.extend_from_slice(&self.param1.to_le_bytes());
+        buffer.extend_from_slice(&self.addr_high.to_le_bytes());
+        buffer.extend_from_slice(&self.addr_low.to_le_bytes());
+        Ok(buffer)
+    }
+
+    fn deserialize(buffer: &[u8]) -> Result<Self, PocError> {
+        if buffer.len() < 16 {
+            return Err(PocError::DeserializationError);
+        }
+        Ok(GenericData {
+            param0: u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]),
+            param1: u32::from_le_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]),
+            addr_high: u32::from_le_bytes([buffer[8], buffer[9], buffer[10], buffer[11]]),
+            addr_low: u32::from_le_bytes([buffer[12], buffer[13], buffer[14], buffer[15]]),
+        })
+    }
+}
+
+pub trait AqSerDes {
+    fn serialize(&self) -> Result<Vec<u8>, PocError>;
+    fn deserialize(buffer: &[u8]) -> Result<Self, PocError>
+    where
+        Self: Sized;
+}
+
+pub trait SendAqCommand<T: Default + AqSerDes> {
+    fn send_aq_command(
+        &self,
+        command: &mut AqDescriptor<T>,
+        buffer: Option<&[u8]>,
+    ) -> Result<(), PocError>;
+}
+
+pub trait ReceiveAqCommand<T: Default + AqSerDes> {
+    fn receive_aq_command(&self) -> Result<(AqDescriptor<T>, Vec<u8>), PocError>;
+}
+
+impl<T: Default + AqSerDes> AqSerDes for AqDescriptor<T> {
+    fn serialize(&self) -> Result<Vec<u8>, PocError> {
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(&self.flags.to_le_bytes());
+        buffer.extend_from_slice(&self.opcode.to_le_bytes());
+        buffer.extend_from_slice(&self.datalen.to_le_bytes());
+        buffer.extend_from_slice(&self.retval.to_le_bytes());
+        buffer.extend_from_slice(&self.cookie_high.to_le_bytes());
+        buffer.extend_from_slice(&self.cookie_low.to_le_bytes());
+        buffer.extend_from_slice(&self.flex_data.serialize()?);
+        Ok(buffer)
+    }
+
+    fn deserialize(buffer: &[u8]) -> Result<Self, PocError> {
+        if buffer.len() < 16 {
+            return Err(PocError::DeserializationError);
+        }
+        let flags = u16::from_le_bytes([buffer[0], buffer[1]]);
+        let opcode = u16::from_le_bytes([buffer[2], buffer[3]]);
+        let datalen = u16::from_le_bytes([buffer[4], buffer[5]]);
+        let retval = u16::from_le_bytes([buffer[6], buffer[7]]);
+        let cookie_high = u32::from_le_bytes([buffer[8], buffer[9], buffer[10], buffer[11]]);
+        let cookie_low = u32::from_le_bytes([buffer[12], buffer[13], buffer[14], buffer[15]]);
+
+        let flex_data = T::deserialize(&buffer[16..])?;
+
+        Ok(AqDescriptor {
+            flags,
+            opcode,
+            datalen,
+            retval,
+            cookie_high,
+            cookie_low,
+            flex_data,
+        })
+    }
 }
 
 impl VfioInterface {
@@ -933,6 +1079,84 @@ impl VfioInterface {
     fn write_bulk(&self, offset: u64, data: &[u8]) -> Result<(), PocError> {
         self.device.region_write(self.region_id, data, offset);
         Ok(())
+    }
+}
+
+impl<T: Default + AqSerDes> SendAqCommand<T> for VfioInterface {
+    fn send_aq_command(
+        &self,
+        command: &mut AqDescriptor<T>,
+        buffer: Option<&[u8]>,
+    ) -> Result<(), PocError> {
+        if let Some(data) = buffer {
+            if data.len() > GL_HIBA_SIZE {
+                return Err(PocError::FailedToSendAqCommand(
+                    "Buffer size exceeds maximum allowed".into(),
+                ));
+            }
+            self.write_bulk(GL_HIBA, &data)?;
+            command.datalen = data.len() as u16;
+            command.flags |= 0x1000;
+            if data.len() > 512 {
+                command.flags |= 0x200; // Set the flag for large data
+            }
+        }
+
+        let serialized_command = command.serialize()?;
+        self.write_bulk(GL_HIDA, &serialized_command)?;
+
+        let mut value = self.read_register32(GL_HICR)?;
+        value |= 0x02;
+        value &= !0x04;
+        self.write_register32(GL_HICR, value)?;
+
+        Ok(())
+    }
+}
+
+pub trait Translate<T: AqSerDes> {
+    fn from(input: T) -> Result<Self, PocError>
+    where
+        Self: Sized + AqSerDes
+    {
+        Ok(Self::deserialize(&input.serialize()?)?)
+    }
+}
+
+impl<T: AqSerDes> Translate<T> for GenericData {}
+
+impl<T: Default + AqSerDes> ReceiveAqCommand<T> for VfioInterface {
+    fn receive_aq_command(&self) -> Result<(AqDescriptor<T>, Vec<u8>), PocError> {
+        let raw_descriptor = self.read_bulk(GL_HIDA, GL_HIDA_SIZE)?;
+        let command = AqDescriptor::<T>::deserialize(&raw_descriptor)?;
+        let response = self.read_bulk(GL_HIDA, command.datalen as usize)?;
+        // if response.is_empty() {
+        //     return Err(PocError::FailedToReceiveAqCommand(
+        //         "No response received".into(),
+        //     ));
+        // }
+        Ok((command, response))
+    }
+}
+
+impl<T: Default + AqSerDes> AdminCommand<T> for VfioInterface {}
+
+pub trait AdminCommand<T: Default + AqSerDes>: SendAqCommand<T> + ReceiveAqCommand<T> {
+    fn execute_command(
+        &self,
+        command: &mut AqDescriptor<T>,
+        buffer: Option<&[u8]>,
+    ) -> Result<(AqDescriptor<T>, Vec<u8>), PocError> {
+        if let Some(buffer) = buffer {
+            if buffer.len() > GL_HIBA_SIZE {
+                return Err(PocError::FailedToSendAqCommand(
+                    "Buffer size exceeds maximum allowed".into(),
+                ));
+            }
+        }
+        self.send_aq_command(command, buffer)?;
+        thread::sleep(Duration::from_millis(100));
+        self.receive_aq_command()
     }
 }
 
@@ -984,6 +1208,8 @@ fn main() -> Result<(), PocError> {
         check_iommu_enabled()?;
 
         let device_path_str = args.device.as_deref().unwrap();
+        // bind_device_to_vfio(device_path_str)?;
+
         let device_path = Path::new("/sys/bus/pci/devices").join(device_path_str);
 
         println!("Using device: {device_path_str}");
@@ -1010,26 +1236,27 @@ fn main() -> Result<(), PocError> {
         let vfio = VfioInterface::new(device, 0);
 
         let descriptor = vfio.read_bulk(GL_HIDA, GL_HIDA_SIZE)?;
-        println!("Descriptor: {:?}", descriptor);
+        println!("Descriptor: {descriptor:?}");
 
-        let descriptor_to_send: [u8; 32] = [0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        vfio.write_bulk(GL_HIDA, &descriptor_to_send)?;
-        let descriptor = vfio.read_bulk(GL_HIDA, GL_HIDA_SIZE)?;
-        println!("Descriptor: {:?}", descriptor);
+        let mut descriptor_to_send = AqDescriptor::from_opcode(1, GenericData::default());
+        vfio.send_aq_command(&mut descriptor_to_send, None)?;
 
         let mut value = vfio.read_register32(GL_HICR)?;
-        println!("HICR value: {:?}", value);
-        value = 0x02;
-        vfio.write_register32(GL_HICR, value)?;
-        value = vfio.read_register32(GL_HICR)?;
-        println!("HICR value: {:?}", value);
+        let descriptor = vfio.read_bulk(GL_HIDA, GL_HIDA_SIZE)?;
+
+        println!("Descriptor: {descriptor:?}");
+        println!("HICR value: {value:?}");
 
         thread::sleep(Duration::from_millis(100));
 
         let descriptor = vfio.read_bulk(GL_HIDA, GL_HIDA_SIZE)?;
-        println!("Descriptor: {:?}", descriptor);
+        println!("Descriptor: {descriptor:?}");
         value = vfio.read_register32(GL_HICR)?;
-        println!("HICR value: {:?}", value);
+        println!("HICR value: {value:?}");
+
+        let (response, response_data) = vfio.execute_command(&mut descriptor_to_send, None)?;
+        println!("Response: {response:?}");
+        println!("Response Data: {response_data:?}");
     }
     Ok(())
 }
