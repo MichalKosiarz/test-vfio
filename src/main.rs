@@ -916,6 +916,7 @@ pub struct VfioInterface {
     region_id: u32,
 }
 
+#[derive(Debug)]
 pub struct AqDescriptor<T>
 where
     T: AqSerDes,
@@ -963,7 +964,7 @@ impl<T: Default + AqSerDes> AqDescriptor<T> {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct GenericData {
     param0: u32,
     param1: u32,
@@ -1113,16 +1114,27 @@ impl<T: Default + AqSerDes> SendAqCommand<T> for VfioInterface {
     }
 }
 
+pub trait Translate<T: AqSerDes> {
+    fn from(input: T) -> Result<Self, PocError>
+    where
+        Self: Sized + AqSerDes
+    {
+        Ok(Self::deserialize(&input.serialize()?)?)
+    }
+}
+
+impl<T: AqSerDes> Translate<T> for GenericData {}
+
 impl<T: Default + AqSerDes> ReceiveAqCommand<T> for VfioInterface {
     fn receive_aq_command(&self) -> Result<(AqDescriptor<T>, Vec<u8>), PocError> {
         let raw_descriptor = self.read_bulk(GL_HIDA, GL_HIDA_SIZE)?;
         let command = AqDescriptor::<T>::deserialize(&raw_descriptor)?;
         let response = self.read_bulk(GL_HIDA, command.datalen as usize)?;
-        if response.is_empty() {
-            return Err(PocError::FailedToReceiveAqCommand(
-                "No response received".into(),
-            ));
-        }
+        // if response.is_empty() {
+        //     return Err(PocError::FailedToReceiveAqCommand(
+        //         "No response received".into(),
+        //     ));
+        // }
         Ok((command, response))
     }
 }
@@ -1134,7 +1146,7 @@ pub trait AdminCommand<T: Default + AqSerDes>: SendAqCommand<T> + ReceiveAqComma
         &self,
         command: &mut AqDescriptor<T>,
         buffer: Option<&[u8]>,
-    ) -> Result<(), PocError> {
+    ) -> Result<(AqDescriptor<T>, Vec<u8>), PocError> {
         if let Some(buffer) = buffer {
             if buffer.len() > GL_HIBA_SIZE {
                 return Err(PocError::FailedToSendAqCommand(
@@ -1144,8 +1156,7 @@ pub trait AdminCommand<T: Default + AqSerDes>: SendAqCommand<T> + ReceiveAqComma
         }
         self.send_aq_command(command, buffer)?;
         thread::sleep(Duration::from_millis(100));
-        self.receive_aq_command()?;
-        Ok(())
+        self.receive_aq_command()
     }
 }
 
@@ -1242,6 +1253,10 @@ fn main() -> Result<(), PocError> {
         println!("Descriptor: {descriptor:?}");
         value = vfio.read_register32(GL_HICR)?;
         println!("HICR value: {value:?}");
+
+        let (response, response_data) = vfio.execute_command(&mut descriptor_to_send, None)?;
+        println!("Response: {response:?}");
+        println!("Response Data: {response_data:?}");
     }
     Ok(())
 }
